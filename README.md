@@ -1,140 +1,160 @@
-# Autocolorizer — Basic Automatic Image Colorization
+# Autocolorizer
 
-> Hybrid U-Net + Zhang Classification approach to automatic black-and-white photo colorization.
+> Automatic colorization of black-and-white photos with a U-Net (EfficientNet-B4 encoder) that classifies every pixel into one of 313 Zhang color bins.
 
 **Authors:** Malwina Belczewska & Oliwier Mróz
 
-> *Note: This notebook and its documentation were originally written in Polish and later translated into English. A few Polish strings may still remain in the code (e.g. console messages).*
+![Grayscale input, pre-trained U-Net, U-Net after GAN training, and ground truth for three COCO validation images](assets/comparison.png)
+
+*COCO val2017 images. Columns: grayscale input · pre-trained U-Net (final model) · after GAN training · ground truth (quantized to the 313 bins).*
+
+The **final model is the pre-trained U-Net**. We also tried adversarial (PatchGAN) training on top of it, but it did not improve the results (see [Results](#results)).
 
 ------------------------------------------------------------------------
 
-## Overview
+## Quick start
 
-This project implements an AI system for automatic, photorealistic colorization of grayscale images. Rather than treating colorization as a regression problem (which tends to produce desaturated, "safe" brownish results), we implement the **Zhang 2016 classification approach** combined with a **hybrid U-Net architecture** and a **PatchGAN discriminator**.
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/omroz14/NN-Autocolorizer/blob/main/Autocolorizer_EN.ipynb)
 
-The core idea: instead of predicting exact color values, the network classifies each pixel into one of **313 discrete color bins** in CIELab space — producing vivid, confident colorizations.
+Everything (data loading, training, evaluation, plots) lives in one notebook, [`Autocolorizer_EN.ipynb`](Autocolorizer_EN.ipynb).
+
+1. Install the dependencies (developed on Python 3.11):
+
+   ``` bash
+   pip install torch torchvision segmentation-models-pytorch scikit-image Pillow tqdm matplotlib numpy
+   ```
+
+2. Download [COCO 2017](https://cocodataset.org/#download) (`train2017` and `val2017`) and set `TRAIN_DIR` / `VAL_DIR` in the dataset cell to the matching folders.
+
+3. Run the notebook. The Zhang quantization files (`pts_in_hull.npy`, `prior_probs.npy`) are downloaded automatically on first run.
+
+### Pretrained weights
+
+The checkpoints (~80–270 MB each) are not in the repository because of their size. They are in this **[Google Drive folder](https://drive.google.com/drive/folders/1Y0CaliVxfVj_rxoWWUAJ-ZFTegNpwm8D?usp=sharing)**, along with other project assets.
 
 ------------------------------------------------------------------------
 
-## Architecture
+## How it works
 
-### Generator — Hybrid U-Net
+Treating colorization as regression (predicting exact color values) makes the network average uncertain colors, which gives desaturated, brownish images. Following [Zhang et al. (2016)](https://arxiv.org/abs/1603.08511), we treat it as **classification** instead:
 
-| Component   | Details                                              |
-|-------------|------------------------------------------------------|
-| **Encoder** | EfficientNet-B4 (pretrained on ImageNet)             |
-| **Decoder** | U-Net with skip connections                          |
-| **Input**   | Grayscale L channel, triplicated → `(256 × 256 × 3)` |
-| **Output**  | Per-pixel distribution over 313 Zhang color bins     |
+1. Convert the image to CIELab. The lightness channel **L** is the input.
+2. Quantize the color channels **ab** into **313 bins**. Each pixel's target is the index of its nearest bin.
+3. The network predicts a probability distribution over the 313 bins for every pixel.
+4. Turn that distribution back into a color with the **annealed mean** (softmax at temperature `T = 0.38`). This is sharper than a plain average and smoother than argmax.
 
-The L channel is triplicated so the pretrained EfficientNet-B4 encoder can be used without modification (it expects 3-channel input). Skip connections preserve fine spatial detail and prevent color bleeding across edges. The architecture is built on top of `segmentation_models_pytorch` (`smp.Unet`).
+A **rebalanced cross-entropy** loss weights rare, saturated colors more heavily so the model doesn't settle for safe sepia tones.
 
-### Discriminator — PatchGAN
+### Generator: U-Net + EfficientNet-B4
 
-A PatchGAN discriminator evaluates local `70×70` patches rather than the full image, focusing on whether local textures and color transitions look realistic. It outputs a `30×30` judgment map, uses **spectral normalization** + **InstanceNorm + LeakyReLU(0.2)**, and is trained as an **LSGAN** (MSE loss instead of BCE). Its input is the concatenation of the `L` and `ab` channels.
+| Component   | Details                                                         |
+|-------------|-----------------------------------------------------------------|
+| **Encoder** | EfficientNet-B4, pretrained on ImageNet                         |
+| **Decoder** | U-Net with skip connections (`segmentation_models_pytorch.Unet`) |
+| **Input**   | L channel repeated ×3 → `256 × 256 × 3`, so ImageNet weights load unchanged |
+| **Output**  | 313 logits per pixel                                            |
 
-### Loss Function (Generator)
+Skip connections preserve fine detail and keep colors from bleeding across edges.
 
-```         
+### Discriminator: PatchGAN (GAN phases only)
+
+A PatchGAN judges local `70×70` patches instead of the whole image and outputs a `30×30` realism map. It uses spectral normalization, InstanceNorm and LeakyReLU(0.2), takes the concatenation of `L` and `ab` as input, and is trained as an LSGAN (MSE instead of BCE).
+
+### Generator loss
+
+```
 L_total = λ_zhang · L_zhang + λ_l1 · L_l1 + λ_adv · L_adv
 ```
 
--   **Zhang rebalanced CrossEntropy** — main classification loss; class weights boost rare, vivid colors (used in all phases)
--   **L1 loss** — pixel-level consistency against the ground-truth ab channels (GAN phase only)
--   **Adversarial loss** — GAN signal from the PatchGAN discriminator (active only after warmup)
-
-> Note: the pre-training phase uses the Zhang rebalanced CrossEntropy **alone**. The L1 and adversarial terms are introduced only in the GAN phase.
-
-------------------------------------------------------------------------
-
-## Training Pipeline
-
-### Phase 1 — U-Net Pre-training (10 epochs)
-
-Train the generator alone with the **Zhang rebalanced CrossEntropy** loss. This establishes a solid colorization baseline before adversarial training. Uses gradient accumulation (every 4 steps), mixed precision (AMP), early stopping (patience = 7), and a `ReduceLROnPlateau` scheduler (×0.5 after 3 epochs without improvement).
-
-### Phase 2 — GAN Training (15 epochs, warmup 5 epochs)
-
-During the first 5 epochs (warmup), only the generator trains — giving it time to stabilize before the discriminator starts providing feedback. After warmup, both networks train alternately each iteration (LSGAN).
-
-### Phase 3 — Final Fine-Tuning (resume from `gan_best`, no warmup)
-
-The first GAN run did not improve over the pre-trained baseline, so training is resumed from the best checkpoint with a corrected loss balance: a lower `lambda_l1`, a stronger `lambda_adv`, and a lower generator learning rate for more stable convergence. Warmup is skipped because the generator is already trained.
-
-**Key hyperparameters:**
-
-| Parameter               | Phase 2 — GAN run | Phase 3 — Fine-tuning |
-|-------------------------|-------------------|-----------------------|
-| Epochs                  | 15                | 10                    |
-| Warmup epochs           | 5                 | 0                     |
-| `lambda_zhang`          | 1.0               | 1.0                   |
-| `lambda_l1`             | 10.0              | 2.0                   |
-| `lambda_adv`            | 0.1               | 0.2                   |
-| `lr_G`                  | 2e-4              | 1e-4                  |
-| `lr_D`                  | 5e-5              | 5e-5                  |
-| Early stopping patience | 7                 | 7                     |
+| Term | What it does | Used in |
+|------|--------------|---------|
+| `L_zhang` | Rebalanced cross-entropy over the 313 bins | all phases |
+| `L_l1` | L1 between the annealed-mean `ab` and ground truth | GAN phases |
+| `L_adv` | LSGAN signal from the PatchGAN | GAN phases, after warmup |
 
 ------------------------------------------------------------------------
 
-## Dataset
+## Training
 
-[COCO 2017](https://cocodataset.org/) — train/val/test splits (≈30 000 train / 1 000 val images per loader).
+<details>
+<summary>Training setup, phases and hyperparameters</summary>
 
-Images are converted to CIELab color space. The L channel serves as network input; the ab channels are quantized to the 313 Zhang bins as training targets. Images with very low color variance (`std(ab) < 0.5`) are filtered out so that near-grayscale photos do not dominate training.
+### Data
+
+- **Train:** the first 30 000 images of COCO `train2017` (in directory-listing order, not a random sample).
+- **Validation:** the first 1 000 images of COCO `val2017`.
+- Images are resized to `256 × 256`. Near-grayscale images (`std(ab) < 0.5`) are skipped.
+- Augmentation (train only): horizontal flip, `RandomResizedCrop(scale 0.8–1.0)`, lightness scaling by a factor in `[0.85, 1.15]`.
+- Batch size 8, seed 42.
+
+### Hardware
+
+A single NVIDIA RTX 3060 (12 GB). One epoch over 30 000 images takes about 1 hour; all three phases together took about 35 hours.
+
+### Phase 1: U-Net pre-training (10 epochs)
+
+The generator alone, trained with `L_zhang` only. Adam (`lr = 3e-4`), gradient accumulation over 4 steps, mixed precision (AMP), gradient clipping at 1.0, `ReduceLROnPlateau` (×0.5 after 3 epochs without improvement) and early stopping (patience 7).
+
+### Phase 2: GAN training (15 epochs, 5 warmup)
+
+Starts from the best pre-trained checkpoint. For the first 5 epochs only the generator trains, so it can adapt to the new loss before the discriminator starts. After that, D and G update alternately every iteration.
+
+### Phase 3: fine-tuning (10 epochs, no warmup)
+
+Resumes from the best Phase 2 checkpoint with a weaker L1 term, a stronger adversarial term and a lower generator learning rate, so the discriminator has more influence.
+
+| Parameter               | Phase 1 | Phase 2 | Phase 3 |
+|-------------------------|---------|---------|---------|
+| Max epochs              | 10      | 15      | 10      |
+| Epochs actually run     | 10      | 10 (early stop) | 8 (early stop) |
+| Warmup epochs           | –       | 5       | 0       |
+| `lambda_zhang`          | 1.0     | 1.0     | 1.0     |
+| `lambda_l1`             | –       | 10.0    | 2.0     |
+| `lambda_adv`            | –       | 0.1     | 0.2     |
+| `lr_G`                  | 3e-4    | 2e-4    | 1e-4    |
+| `lr_D`                  | –       | 5e-5    | 5e-5    |
+| Gradient accumulation   | 4       | 2       | 2       |
+| Early stopping patience | 7       | 7       | 7       |
+
+</details>
 
 ------------------------------------------------------------------------
 
 ## Results
 
-The pre-trained U-Net produces semantically plausible colorizations for the majority of scenes. **Neither GAN phase yielded a consistent metric improvement over the pre-trained baseline** — in both runs the validation loss (Zhang + L1) failed to improve after a few epochs, triggering early stopping. The best checkpoint originated from the **warmup phase of the first GAN run (epoch 3, Val = 4.4753)**, before the discriminator started training; from epoch 6 onward the validation loss rose steadily (4.52 → 4.56 → 4.66).
+**The pre-trained U-Net is the best model.** It gives plausible colors for most scenes: grass, foliage, wood, fur and skin come out right. It tends to under-saturate objects whose color is ambiguous from lightness alone (in the example above, the blue duvet comes out brown).
 
-The likely cause was an overly strong L1 penalty (`lambda_l1 = 10.0`) that suppressed the adversarial signal. The fine-tuning phase corrected this (`lambda_l1 = 2.0`, `lambda_adv = 0.2`) but still did not produce a measurable improvement.
+![Pre-training loss curves](assets/pretrain_loss.png)
 
-Overall, balancing the L1 and adversarial signals remains the main open challenge — a known difficulty in conditional image generation. Further gains would likely require longer GAN training, a larger dataset, or a more global encoder architecture (e.g. a Swin Transformer).
+Pre-training reached its best validation loss at epoch 7 (3.680) and started to overfit after that.
 
-------------------------------------------------------------------------
+**GAN training did not help.** In both GAN runs, validation loss was lowest within the first few epochs and then rose until early stopping:
 
-## Project Structure
+| Run | Validation loss measured as | Best val | Best epoch |
+|-----|------------------------------|----------|------------|
+| Phase 1: pre-training | `L_zhang` | 3.680 | 7 / 10 |
+| Phase 2: GAN | `L_zhang + 10 · L_l1` | 4.475 | 3 / 10 (still in warmup) |
+| Phase 3: fine-tuning | `L_zhang + 2 · L_l1` | 3.952 | 1 / 8 |
 
-```         
-autocolorizer/
-├── Autocolorizer_EN.ipynb     # Main training notebook (pre-training + GAN + fine-tuning), translated from Polish
-├── README.md
-└── .gitignore
-```
+> The validation numbers are **not comparable across rows**, because each run's validation loss includes a different L1 weight. They only show the trend within a run.
 
-> **Model weights** are not included in this repository due to file size (\~80–270 MB each).\
-> Pretrained checkpoints available on Google Drive: [link]\
-> *(replace with your actual Drive link)*
+In Phase 2, the best checkpoint came from the warmup, before the discriminator was switched on. Once it started (epoch 6), validation loss rose steadily (4.52 → 4.56 → 4.66). Our reading is that the strong L1 term (`λ_l1 = 10`) drowned out the adversarial signal. Phase 3 lowered it (`λ_l1 = 2`, `λ_adv = 0.2`), but validation loss still went up from the first epoch. Visually, the GAN output is slightly more muted than the pre-trained U-Net.
 
-------------------------------------------------------------------------
-
-## Setup & Usage
-
-This project was developed in Google Colab. Open the notebook directly:
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://drive.google.com/file/d/1dR0Qc7AZMdR7VJKRcWFlQZmqNNYJ7otj/view?usp=sharing)
-
-### Dependencies
-
-``` bash
-pip install torch torchvision segmentation-models-pytorch
-pip install scikit-image Pillow tqdm matplotlib numpy
-```
-
-The Zhang quantization data (`pts_in_hull.npy`, `prior_probs.npy`) is downloaded automatically from the original repository when the notebook runs.
+Balancing the L1 and adversarial terms remains the main open problem, and it is a known difficulty in conditional image generation. Likely next steps: longer GAN training, more data, a more global encoder (e.g. a Swin Transformer), and image-quality metrics (PSNR, SSIM, LPIPS or colorfulness) instead of the training loss alone.
 
 ------------------------------------------------------------------------
 
 ## References
 
--   Zhang, R., Isola, P., & Efros, A. A. (2016). **Colorful Image Colorization**. *ECCV 2016*. [[paper]](https://arxiv.org/abs/1603.08511) [[code]](https://github.com/richzhang/colorization)
--   Isola, P., Zhu, J. Y., Zhou, T., & Efros, A. A. (2017). **Image-to-Image Translation with Conditional Adversarial Networks**. *CVPR 2017*. [[paper]](https://arxiv.org/abs/1611.07004)
+- Zhang, R., Isola, P., & Efros, A. A. (2016). **Colorful Image Colorization**. *ECCV 2016*. [[paper]](https://arxiv.org/abs/1603.08511) [[code]](https://github.com/richzhang/colorization)
+- Isola, P., Zhu, J. Y., Zhou, T., & Efros, A. A. (2017). **Image-to-Image Translation with Conditional Adversarial Networks**. *CVPR 2017*. [[paper]](https://arxiv.org/abs/1611.07004)
 
-Color quantization data (`pts_in_hull.npy`, `prior_probs.npy`) sourced from [richzhang/colorization](https://github.com/richzhang/colorization) under BSD-2-Clause license.
-
-------------------------------------------------------------------------
+The color quantization data (`pts_in_hull.npy`, `prior_probs.npy`) comes from [richzhang/colorization](https://github.com/richzhang/colorization) under the BSD-2-Clause license.
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE).
+
+---
+
+<sub>The notebook was originally written in Polish and translated to English, so some console output and plot labels are still in Polish.</sub>
